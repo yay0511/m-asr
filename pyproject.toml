@@ -1,9 +1,24 @@
 [project]
 name = "m-asr"
 version = "0.1.0"
-description = "Add your description here"
+description = "Streaming multi-speaker ASR cascade with X-ASR and pyannote"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=1.26",
     "pyannote-audio>=4.0.7",
+    "pyyaml>=6.0.0",
+    "soundfile>=0.12.1",
 ]
+
+[project.optional-dependencies]
+asr = [
+    "sherpa-onnx>=1.13.2",
+    "sherpa-onnx-core>=1.13.2",
+]
+
+[project.scripts]
+m-asr = "m_asr.main:main"
+
+[tool.uv]
+package = true

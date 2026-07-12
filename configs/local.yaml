@@ -1,0 +1,34 @@
+paths:
+  x_asr_root: /root/shared-nvme/yuxinliu/X-ASR
+  pyannote_audio_root: /root/shared-nvme/yuxinliu/pyannote-audio-4.0.7
+  pyannote_model_dir: /root/shared-nvme/yuxinliu/pyannote-speaker-diarization-community-1
+  x_asr_model_dir: /root/shared-nvme/yuxinliu/X-ASR/X-ASR-zh-en/deployment/models/chunk-960ms-model
+
+runtime:
+  sample_rate: 16000
+  device: cuda
+  asr_provider: cuda
+  max_workers: 2
+
+chunker:
+  frame_ms: 20
+  speech_onset_threshold: 0.5
+  speech_offset_threshold: 0.35
+  energy_reference: 0.008
+  end_silence_ms: 700
+  min_chunk_duration: 0.8
+  max_chunk_duration: 12.0
+  left_padding_ms: 300
+  right_padding_ms: 300
+
+speaker:
+  same_speaker_threshold: 0.65
+  centroid_update_alpha: 0.85
+  min_embedding_duration: 1.0
+  min_update_confidence: 0.6
+  mode: real
+
+asr:
+  mode: real
+  text_format: none
+  tail_padding_seconds: 1.0
