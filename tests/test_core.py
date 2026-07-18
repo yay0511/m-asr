@@ -8,6 +8,8 @@ from m_asr.types import AudioChunk
 
 def test_chunker_emits_speech_chunk():
     config = AppConfig()
+    config.chunker.vad_provider = "energy"
+    config.chunker.frame_ms = 20
     chunker = SpeechChunker(config.chunker, sample_rate=config.runtime.sample_rate)
     sr = config.runtime.sample_rate
     waveform = np.concatenate(
@@ -24,6 +26,8 @@ def test_chunker_emits_speech_chunk():
 
 def test_speaker_registry_matches_existing_speaker():
     config = AppConfig()
+    config.speaker.min_new_speaker_duration_initial = 1.0
+    config.speaker.min_new_speaker_duration_final = 1.0
     registry = SpeakerRegistry(config.speaker)
     chunk = AudioChunk(0, 0.0, 1.5, np.zeros(24000, dtype=np.float32), 16000)
     first = registry.match(chunk, np.asarray([1.0, 0.0], dtype=np.float32))
@@ -32,7 +36,33 @@ def test_speaker_registry_matches_existing_speaker():
     assert second.speaker_id == "SPEAKER_01"
 
 
+def test_speaker_registry_is_conservative_during_warmup():
+    config = AppConfig()
+    registry = SpeakerRegistry(config.speaker)
+    short_chunk = AudioChunk(0, 0.0, 0.3, np.zeros(4800, dtype=np.float32), 16000)
+    result = registry.match(short_chunk, np.asarray([1.0, 0.0], dtype=np.float32))
+    assert result.speaker_id == "UNKNOWN"
+    assert registry.profiles == ()
+
+
+def test_speaker_registry_prefers_recent_speaker_with_margin():
+    config = AppConfig()
+    config.speaker.min_new_speaker_duration_initial = 1.0
+    config.speaker.min_new_speaker_duration_final = 1.0
+    config.speaker.min_centroid_update_similarity = 0.9
+    registry = SpeakerRegistry(config.speaker)
+
+    first_chunk = AudioChunk(0, 0.0, 2.0, np.zeros(32000, dtype=np.float32), 16000)
+    second_chunk = AudioChunk(1, 2.2, 4.2, np.zeros(32000, dtype=np.float32), 16000)
+    registry.match(first_chunk, np.asarray([1.0, 0.0], dtype=np.float32))
+
+    result = registry.match(second_chunk, np.asarray([0.57, 0.821645], dtype=np.float32))
+    assert result.speaker_id == "SPEAKER_01"
+
+
 def test_config_defaults_to_real_backends():
     config = AppConfig()
     assert config.asr.mode == "real"
     assert config.speaker.mode == "real"
+    assert config.runtime.device == "cpu"
+    assert config.runtime.asr_provider == "auto"

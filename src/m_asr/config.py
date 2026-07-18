@@ -19,30 +19,44 @@ class PathConfig:
 @dataclass(slots=True)
 class RuntimeConfig:
     sample_rate: int = 16000
-    device: str = "cuda"
-    asr_provider: str = "cuda"
+    device: str = "cpu"
+    asr_provider: str = "auto"
     max_workers: int = 2
 
 
 @dataclass(slots=True)
 class ChunkerConfig:
-    frame_ms: int = 20
+    vad_provider: str = "silero"
+    frame_ms: int = 32
+    silero_threshold: float = 0.35
+    silero_min_silence_ms: int = 200
+    silero_speech_pad_ms: int = 0
+    silero_window_samples: int = 512
     speech_onset_threshold: float = 0.5
     speech_offset_threshold: float = 0.35
     energy_reference: float = 0.008
     end_silence_ms: int = 700
-    min_chunk_duration: float = 0.8
-    max_chunk_duration: float = 12.0
-    left_padding_ms: int = 300
-    right_padding_ms: int = 300
+    min_chunk_duration: float = 0.35
+    max_chunk_duration: float = 1.8
+    left_padding_ms: int = 200
+    right_padding_ms: int = 80
 
 
 @dataclass(slots=True)
 class SpeakerConfig:
-    same_speaker_threshold: float = 0.65
+    same_speaker_threshold: float = 0.68
+    last_speaker_threshold: float = 0.56
+    last_speaker_margin: float = 0.08
+    new_speaker_initial_max_similarity: float = 0.08
+    new_speaker_final_max_similarity: float = 0.28
+    new_speaker_warmup_seconds: float = 12.0
+    min_new_speaker_duration_initial: float = 2.0
+    min_new_speaker_duration_final: float = 1.5
+    min_centroid_update_similarity: float = 0.78
     centroid_update_alpha: float = 0.85
-    min_embedding_duration: float = 1.0
+    min_embedding_duration: float = 0.7
     min_update_confidence: float = 0.6
+    assign_uncertain_to_best: bool = True
     mode: str = "real"
 
 
@@ -87,6 +101,21 @@ def _apply_env(config: AppConfig) -> None:
         "X_ASR_MODEL_DIR": (config.paths, "x_asr_model_dir", str),
         "M_ASR_DEVICE": (config.runtime, "device", str),
         "M_ASR_ASR_PROVIDER": (config.runtime, "asr_provider", str),
+        "M_ASR_VAD_PROVIDER": (config.chunker, "vad_provider", str),
+        "M_ASR_SILERO_THRESHOLD": (config.chunker, "silero_threshold", float),
+        "M_ASR_SILERO_MIN_SILENCE_MS": (config.chunker, "silero_min_silence_ms", int),
+        "M_ASR_MIN_CHUNK_DURATION": (config.chunker, "min_chunk_duration", float),
+        "M_ASR_MAX_CHUNK_DURATION": (config.chunker, "max_chunk_duration", float),
+        "M_ASR_RIGHT_PADDING_MS": (config.chunker, "right_padding_ms", int),
+        "M_ASR_SAME_SPEAKER_THRESHOLD": (config.speaker, "same_speaker_threshold", float),
+        "M_ASR_LAST_SPEAKER_THRESHOLD": (config.speaker, "last_speaker_threshold", float),
+        "M_ASR_LAST_SPEAKER_MARGIN": (config.speaker, "last_speaker_margin", float),
+        "M_ASR_MIN_EMBEDDING_DURATION": (config.speaker, "min_embedding_duration", float),
+        "M_ASR_NEW_SPEAKER_FINAL_MAX_SIMILARITY": (
+            config.speaker,
+            "new_speaker_final_max_similarity",
+            float,
+        ),
         "M_ASR_ASR_MODE": (config.asr, "mode", str),
         "M_ASR_SPEAKER_MODE": (config.speaker, "mode", str),
     }

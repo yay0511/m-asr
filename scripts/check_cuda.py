@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import shutil
 import subprocess
 
@@ -28,7 +29,14 @@ def main() -> int:
         import sherpa_onnx
 
         print(f"sherpa_onnx import: ok ({getattr(sherpa_onnx, '__version__', 'unknown')})")
-        print("note: pip sherpa-onnx wheels may be CPU-only; CUDA provider requires a GPU-enabled build.")
+        package_dir = Path(sherpa_onnx.__file__).resolve().parent
+        has_cuda_provider = any(
+            "onnxruntime_providers_cuda" in path.name.lower()
+            for path in package_dir.rglob("*")
+        )
+        print(f"inferred CUDA provider files: {has_cuda_provider}")
+        if not has_cuda_provider:
+            print("note: this sherpa-onnx install appears CPU-only; CUDA provider requires a GPU-enabled build.")
     except Exception as exc:
         print(f"sherpa_onnx import: failed ({type(exc).__name__}: {exc})")
         return 1

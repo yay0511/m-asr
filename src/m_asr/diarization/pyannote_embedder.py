@@ -57,10 +57,29 @@ class PyannoteSpeakerEmbedder:
             raise FileNotFoundError(f"pyannote embedding model not found: {model_dir}")
 
         device_name = self.config.runtime.device
-        if device_name == "cuda" and not torch.cuda.is_available():
+        if device_name == "cuda" and not _torch_cuda_available(torch):
             device_name = "cpu"
-        device = torch.device(device_name)
-        self._embedding = PretrainedSpeakerEmbedding(str(model_dir), device=device)
+        self._embedding = self._load_embedding(
+            PretrainedSpeakerEmbedding,
+            model_dir,
+            torch.device(device_name),
+        )
+
+    def _load_embedding(self, factory: object, model_dir: Path, device: object) -> object:
+        try:
+            return factory(str(model_dir), device=device)
+        except RuntimeError as exc:
+            if str(device) == "cuda" and _is_cuda_runtime_error(exc):
+                import torch
+
+                self.config.runtime.device = "cpu"
+                print(
+                    "[warn  ] CUDA failed while loading pyannote embedding; "
+                    f"falling back to CPU. {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return factory(str(model_dir), device=torch.device("cpu"))
+            raise
 
     def _extract_real(self, chunk: AudioChunk) -> np.ndarray | None:
         import torch
@@ -71,7 +90,50 @@ class PyannoteSpeakerEmbedder:
         if waveform.shape[-1] == 0:
             return None
         tensor = torch.from_numpy(waveform)
-        embedding = self._embedding(tensor)
+        try:
+            embedding = self._embedding(tensor)
+        except RuntimeError as exc:
+            if self.config.runtime.device == "cuda" and _is_cuda_runtime_error(exc):
+                self.config.runtime.device = "cpu"
+                print(
+                    "[warn  ] CUDA failed during pyannote embedding inference; "
+                    "falling back to CPU and retrying this chunk. "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                self._move_embedding_to_cpu()
+                embedding = self._embedding(tensor)
+            else:
+                raise
         if embedding is None or len(embedding) == 0:
             return None
         return np.asarray(embedding[0], dtype=np.float32)
+
+    def _move_embedding_to_cpu(self) -> None:
+        if self._embedding is None:
+            return
+        try:
+            import torch
+
+            if hasattr(self._embedding, "to"):
+                self._embedding.to(torch.device("cpu"))
+        except RuntimeError:
+            raise
+
+
+def _torch_cuda_available(torch_module: object) -> bool:
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="CUDA initialization:.*", category=UserWarning)
+            return bool(torch_module.cuda.is_available())
+    except BaseException:
+        return False
+
+
+def _is_cuda_runtime_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return (
+        "cuda" in message
+        or "nvidia driver" in message
+        or "driver on your system is too old" in message
+    )

@@ -50,6 +50,11 @@ class XAsrClient:
         latency_ms = (time.perf_counter() - started) * 1000.0
         return AsrResult(chunk.chunk_id, text.strip(), True, latency_ms)
 
+    def create_streaming_session(self) -> XAsrStreamingSession:
+        if self._recognizer is None:
+            raise RuntimeError("X-ASR recognizer is not initialized")
+        return XAsrStreamingSession(self._recognizer, self.config)
+
     def _init_real(self) -> None:
         import sherpa_onnx
 
@@ -103,11 +108,46 @@ class XAsrClient:
             self._recognizer.decode_stream(stream)
 
         text = self._recognizer.get_result(stream)
-        if self.config.asr.text_format == "lower":
-            text = text.lower()
-        elif self.config.asr.text_format == "capitalize" and text:
-            text = text[:1].upper() + text[1:].lower()
-        return normalize_cjk_spacing(text)
+        return _format_text(text, self.config)
+
+
+class XAsrStreamingSession:
+    """Stateful streaming recognizer session for realtime WebSocket decoding."""
+
+    def __init__(self, recognizer: object, config: AppConfig):
+        self.recognizer = recognizer
+        self.config = config
+        self.stream = self.recognizer.create_stream()
+        self.last_text = ""
+
+    def accept_waveform(self, samples: np.ndarray, sample_rate: int) -> str:
+        data = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if data.size == 0:
+            return self.last_text
+        self.stream.accept_waveform(sample_rate, data)
+        self._decode_ready()
+        self.last_text = _format_text(self.recognizer.get_result(self.stream), self.config).strip()
+        return self.last_text
+
+    def finish(self) -> str:
+        tail = np.zeros(
+            int(round(self.config.asr.tail_padding_seconds * self.config.runtime.sample_rate)),
+            dtype=np.float32,
+        )
+        if tail.size:
+            self.stream.accept_waveform(self.config.runtime.sample_rate, tail)
+        self.stream.input_finished()
+        self._decode_ready()
+        self.last_text = _format_text(self.recognizer.get_result(self.stream), self.config).strip()
+        return self.last_text
+
+    def reset(self) -> None:
+        self.stream = self.recognizer.create_stream()
+        self.last_text = ""
+
+    def _decode_ready(self) -> None:
+        while self.recognizer.is_ready(self.stream):
+            self.recognizer.decode_stream(self.stream)
 
 
 def _find_asr_files(model_dir: Path) -> tuple[str, dict[str, str]]:
@@ -143,3 +183,11 @@ def _find_asr_files(model_dir: Path) -> tuple[str, dict[str, str]]:
         return "wenet-ctc", {"tokens": tokens, "model": model}
 
     raise FileNotFoundError(f"could not infer ASR model layout under {model_dir}")
+
+
+def _format_text(text: str, config: AppConfig) -> str:
+    if config.asr.text_format == "lower":
+        text = text.lower()
+    elif config.asr.text_format == "capitalize" and text:
+        text = text[:1].upper() + text[1:].lower()
+    return normalize_cjk_spacing(text)

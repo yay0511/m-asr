@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import sys
 from typing import Iterable, Iterator
 import warnings
@@ -150,36 +152,105 @@ def _iter_array_frames(waveform: np.ndarray, frame_samples: int) -> Iterator[np.
 
 
 def resolve_runtime(config: AppConfig) -> None:
-    wants_cuda = config.runtime.device == "cuda" or config.runtime.asr_provider == "cuda"
-    if not wants_cuda:
+    config.runtime.device = str(config.runtime.device).lower()
+    config.runtime.asr_provider = str(config.runtime.asr_provider).lower()
+
+    wants_torch_cuda = config.runtime.device == "cuda"
+    wants_asr_cuda = config.runtime.asr_provider in {"auto", "cuda"}
+
+    torch_module = None
+    cuda_available = False
+    cuda_error: BaseException | None = None
+    if wants_torch_cuda or wants_asr_cuda:
+        try:
+            import torch
+
+            torch_module = torch
+            cuda_available, cuda_error = _torch_cuda_available(torch)
+        except Exception as exc:
+            cuda_error = exc
+
+    if wants_torch_cuda and not cuda_available:
+        _fallback_torch_device_to_cpu(config, _cuda_reason(torch_module, cuda_error))
+
+    if not wants_asr_cuda:
         return
 
+    if config.runtime.asr_provider == "cuda" and _force_sherpa_cuda():
+        if cuda_available:
+            return
+        _fallback_asr_provider_to_cpu(
+            config,
+            "M_ASR_FORCE_SHERPA_CUDA=1 is set, but CUDA is not available. "
+            f"{_cuda_reason(torch_module, cuda_error)}",
+        )
+        return
+
+    if cuda_available and _sherpa_onnx_has_cuda_provider():
+        config.runtime.asr_provider = "cuda"
+        return
+
+    if config.runtime.asr_provider == "cuda":
+        _fallback_asr_provider_to_cpu(
+            config,
+            "the installed sherpa-onnx package does not expose a CUDA provider. "
+            "Install/compile a GPU-enabled sherpa-onnx build, or set "
+            "M_ASR_FORCE_SHERPA_CUDA=1 only after that build is installed.",
+        )
+    config.runtime.asr_provider = "cpu"
+
+
+def _torch_cuda_available(torch_module: object) -> tuple[bool, BaseException | None]:
     try:
-        import torch
-    except Exception as exc:
-        _fallback_to_cpu(config, f"torch cannot be imported: {type(exc).__name__}: {exc}")
-        return
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="CUDA initialization:.*", category=UserWarning)
+            return bool(torch_module.cuda.is_available()), None
+    except BaseException as exc:
+        return False, exc
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="CUDA initialization:.*", category=UserWarning)
-        cuda_available = torch.cuda.is_available()
 
-    if cuda_available:
-        return
-
-    cuda_build = getattr(torch.version, "cuda", None)
-    _fallback_to_cpu(
-        config,
-        "torch.cuda.is_available() is False. "
-        f"Installed torch={torch.__version__}, torch CUDA build={cuda_build}. "
-        "Run `uv run --offline --extra asr python scripts/check_cuda.py` for details.",
+def _cuda_reason(torch_module: object | None, cuda_error: BaseException | None) -> str:
+    if torch_module is None:
+        return f"torch cannot be imported: {type(cuda_error).__name__}: {cuda_error}"
+    cuda_build = getattr(torch_module.version, "cuda", None)
+    reason = "torch.cuda.is_available() is False."
+    if cuda_error:
+        reason = f"torch CUDA check failed: {type(cuda_error).__name__}: {cuda_error}"
+    return (
+        f"{reason} "
+        f"Installed torch={torch_module.__version__}, torch CUDA build={cuda_build}. "
+        "Run `uv run --offline --extra asr python scripts/check_cuda.py` for details."
     )
 
 
-def _fallback_to_cpu(config: AppConfig, reason: str) -> None:
+def _sherpa_onnx_has_cuda_provider() -> bool:
+    try:
+        import sherpa_onnx
+    except Exception:
+        return False
+
+    package_dir = Path(sherpa_onnx.__file__).resolve().parent
+    return any(
+        "onnxruntime_providers_cuda" in path.name.lower()
+        for path in package_dir.rglob("*")
+    )
+
+
+def _force_sherpa_cuda() -> bool:
+    return os.getenv("M_ASR_FORCE_SHERPA_CUDA", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_torch_device_to_cpu(config: AppConfig, reason: str) -> None:
     print(
-        f"[warn  ] CUDA requested but unavailable; falling back to CPU. {reason}",
+        f"[warn  ] CUDA requested for pyannote but unavailable; using CPU. {reason}",
         file=sys.stderr,
     )
     config.runtime.device = "cpu"
+
+
+def _fallback_asr_provider_to_cpu(config: AppConfig, reason: str) -> None:
+    print(
+        f"[warn  ] CUDA requested for X-ASR but unavailable; using sherpa-onnx CPU provider. {reason}",
+        file=sys.stderr,
+    )
     config.runtime.asr_provider = "cpu"
