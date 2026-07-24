@@ -192,7 +192,7 @@ configs/local.yaml
 ```yaml
 runtime:
   sample_rate: 16000
-  device: cpu
+  device: cuda
   asr_provider: auto
   max_workers: 2
 ```
@@ -275,14 +275,14 @@ bash scripts/run_web.sh --host 0.0.0.0 --port 8000
 
 ## CUDA 说明
 
-默认 pyannote/torch device 是 CPU，X-ASR provider 是 auto。这样可以避免 NVIDIA driver 太旧时把 RuntimeError 直接暴露到 Web 页面。
+默认 pyannote/torch device 是 CUDA，X-ASR provider 是 auto。GPU 网页推荐通过 `scripts/run_web_gpu.sh` 启动；该脚本使用 `/root/.conda/envs/pyannote/bin/python` 并在启动前强制检查 `torch.cuda.is_available()`。
 
-需要尝试 GPU：
+启动 GPU 网页：
 
 ```bash
-M_ASR_DEVICE=cuda bash scripts/run_web.sh --host 0.0.0.0 --port 8000
+bash scripts/run_web_gpu.sh --host 0.0.0.0 --port 8001
 ```
 
-`StreamingCascadePipeline` 初始化时会检查 `torch.cuda.is_available()`。如果 CUDA 不可用，会打印 warning 并把 pyannote device 切换为 CPU 继续运行。
+`StreamingCascadePipeline` 初始化时会检查 `torch.cuda.is_available()`。如果使用普通 `run_web.sh` 且 CUDA 不可用，会打印 warning 并把 pyannote device 切换为 CPU 继续运行；如果使用 `run_web_gpu.sh`，CUDA 不可用会在启动前直接失败。
 
 X-ASR 的 CUDA 能力取决于 `sherpa-onnx` 是否包含 ONNX Runtime CUDA provider。pip 版 `sherpa-onnx` 常见为 CPU-only，此时 `asr_provider: auto` 会显式选择 CPU provider，避免 C++ 层反复 fallback。X-ASR 要真正跑 CUDA，需要安装或编译 GPU-enabled sherpa-onnx；安装后可用 `M_ASR_FORCE_SHERPA_CUDA=1` 强制验证。

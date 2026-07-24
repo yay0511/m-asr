@@ -19,7 +19,7 @@ class PathConfig:
 @dataclass(slots=True)
 class RuntimeConfig:
     sample_rate: int = 16000
-    device: str = "cpu"
+    device: str = "cuda"
     asr_provider: str = "auto"
     max_workers: int = 2
 

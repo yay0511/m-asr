@@ -64,5 +64,5 @@ def test_config_defaults_to_real_backends():
     config = AppConfig()
     assert config.asr.mode == "real"
     assert config.speaker.mode == "real"
-    assert config.runtime.device == "cpu"
+    assert config.runtime.device == "cuda"
     assert config.runtime.asr_provider == "auto"

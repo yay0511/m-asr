@@ -293,7 +293,7 @@ LIVE_HTML_PAGE = """<!doctype html>
       document.querySelector('#json pre').textContent = JSON.stringify(events, null, 2);
       if (message.type === 'ready') {
         document.getElementById('asrBackend').textContent = message.backends.asr;
-        document.getElementById('runtimeDevice').textContent = `${message.runtime.device} / ${message.runtime.asr_provider}`;
+        document.getElementById('runtimeDevice').textContent = `Speaker ${message.runtime.device} / ASR ${message.runtime.asr_provider}`;
         if (message.warning) {
           const notice = document.getElementById('notice');
           notice.textContent = message.warning;
@@ -778,7 +778,7 @@ HTML_PAGE = """<!doctype html>
     function renderResult(data) {
       document.getElementById('asrBackend').textContent = data.backends.asr;
       document.getElementById('speakerBackend').textContent = data.backends.speaker;
-      document.getElementById('runtimeDevice').textContent = `${data.runtime.device} / ${data.runtime.asr_provider}`;
+      document.getElementById('runtimeDevice').textContent = `Speaker ${data.runtime.device} / ASR ${data.runtime.asr_provider}`;
       document.getElementById('notice').textContent = data.warning || '真实 X-ASR + pyannote 流程已完成。';
       document.getElementById('notice').className = data.warning ? 'notice warn' : 'notice';
       document.getElementById('transcript').innerHTML = renderTurns(data.transcript);
@@ -1006,13 +1006,32 @@ class WebAsrHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
+def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
         encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+def _runtime_warning(config: Any, realtime: bool) -> str:
+    flow = "实时识别" if realtime else "文件识别"
+    speaker_device = str(config.runtime.device).lower()
+    asr_provider = str(config.runtime.asr_provider).lower()
+    if speaker_device == "cuda" and asr_provider == "cuda":
+        return ""
+    if speaker_device == "cuda" and asr_provider == "cpu":
+        return (
+            f"{flow}中 speaker embedding 正在使用 CUDA；"
+            "X-ASR 当前使用 CPU，因为当前 sherpa-onnx 安装不包含 CUDA provider。"
+        )
+    if speaker_device == "cpu" and asr_provider == "cuda":
+        return (
+            f"{flow}中 X-ASR 正在使用 CUDA；"
+            "speaker embedding 当前使用 CPU，因为 torch CUDA 不可用或 pyannote 已回退。"
+        )
+    return f"{flow}当前使用 CPU；请检查 torch CUDA、GPU 设备和 sherpa-onnx CUDA provider。"
 
 
 def transcribe_file(path: Path, config_path: str) -> dict[str, Any]:
@@ -1023,9 +1042,7 @@ def transcribe_file(path: Path, config_path: str) -> dict[str, Any]:
     events: list[PipelineEvent] = list(pipeline.process_waveform(waveform, sample_rate))
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-    warning = ""
-    if config.runtime.device == "cpu" or config.runtime.asr_provider == "cpu":
-        warning = "CUDA 不可用或当前 sherpa-onnx 不支持 CUDA provider，本次已使用 CPU。"
+    warning = _runtime_warning(config, realtime=False)
     if not any(event.event_type == "chunk_finalized" for event in events):
         warning = "没有切出语音 chunk；请检查音频音量或 chunker.energy_reference。"
     elif not pipeline.transcript:
@@ -1060,9 +1077,7 @@ class LiveWebSocketSession:
         self._speaker_futures: list[tuple[Any, str, Future[Any]]] = []
 
     def run(self) -> None:
-        warning = ""
-        if self.config.runtime.device == "cpu" or self.config.runtime.asr_provider == "cpu":
-            warning = "CUDA 不可用或当前 sherpa-onnx 不支持 CUDA provider，本次实时识别使用 CPU。"
+        warning = _runtime_warning(self.config, realtime=True)
         _ws_send_json(
             self.handler,
             {

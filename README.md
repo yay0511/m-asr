@@ -113,11 +113,17 @@ speaker:
 
 ```yaml
 runtime:
-  device: cpu
+  device: cuda
   asr_provider: auto
 ```
 
-`device: cpu` 会让 pyannote/torch 默认走 CPU，避免 NVIDIA driver 不匹配时触发 CUDA RuntimeError。需要手动尝试 GPU 时，可以临时设置 `M_ASR_DEVICE=cuda`。
+`device: cuda` 会让 pyannote/torch 默认请求 GPU。推荐用 conda `pyannote` 环境启动 GPU 网页：
+
+```bash
+bash scripts/run_web_gpu.sh --host 0.0.0.0 --port 8001
+```
+
+该脚本启动前会检查 `torch.cuda.is_available()`，如果 GPU 不可用会直接退出并打印诊断，不会静默退到 CPU。
 
 `asr_provider: auto` 表示 X-ASR 只有在当前 `sherpa-onnx` 安装能看到 CUDA provider 时才传 `cuda`，否则显式传 `cpu`，避免 C++ 层反复 fallback。当前 pip 版 `sherpa-onnx` 常见为 CPU-only；X-ASR 要真正跑 CUDA，需要安装或编译 GPU-enabled sherpa-onnx，安装后可用 `M_ASR_FORCE_SHERPA_CUDA=1` 强制验证。
 
@@ -175,6 +181,87 @@ speaker:
 已有 speaker 时，不确定 embedding 会先分配给最相似 speaker，减少 `UNKNOWN`。低置信匹配只影响显示结果，不会更新 centroid；只有相似度超过 `min_centroid_update_similarity` 的高质量 chunk 才会更新 speaker centroid。
 
 如果多人说话仍被合并，优先把 `max_chunk_duration` 调小到 `1.2` 或把 `silero_min_silence_ms` 调小到 `150`；如果切得太碎，则反向调大。
+
+## AMI 测评
+
+测评脚本会输出 `DER`、`cpCER`、`tcpCER`、`cpWER`、`tcpWER`，并把完整结果写入 `metrics.json`。
+
+轻量入口默认只跑 `EN2001a` 前 300 秒：
+
+```bash
+cd /root/shared-nvme/yuxinliu/m_asr
+bash scripts/eval_ami_quick.sh
+```
+
+默认会重新跑预测，避免复用旧参数生成的 `pred`。确认要复用已有单会议预测时再设置：
+
+```bash
+M_ASR_EVAL_RESUME=1 bash scripts/eval_ami_quick.sh
+```
+
+常用参数通过环境变量覆盖：
+
+```bash
+M_ASR_EVAL_MEETINGS=EN2001a \
+M_ASR_EVAL_MAX_SECONDS=120 \
+M_ASR_EVAL_OUTPUT_DIR=eval/ami_array1_01_2min \
+bash scripts/eval_ami_quick.sh
+```
+
+文本指标较慢。需要先快速看覆盖率和 DER 时：
+
+```bash
+M_ASR_EVAL_MEETINGS=EN2001a,EN2001b,EN2001d \
+M_ASR_EVAL_START_SECONDS=60 \
+M_ASR_EVAL_MAX_SECONDS=600 \
+M_ASR_EVAL_METRICS=fast \
+M_ASR_EVAL_OUTPUT_DIR=eval/ami_3meetings_60_660_fast \
+bash scripts/eval_ami_quick.sh
+```
+
+只计算 cpWER/cpCER，不算更慢的 tcp 指标：
+
+```bash
+M_ASR_EVAL_METRICS=summary,der,cpwer,cpcer bash scripts/eval_ami_quick.sh
+```
+
+完整指标：
+
+```bash
+M_ASR_EVAL_METRICS=all bash scripts/eval_ami_quick.sh
+```
+
+如果要模拟网页端“先稳定一会儿再开始计分”，设置评分起点和 warmup。下面命令会先让模型处理 `0-60s` 音频建立流式状态，然后只评测 `60-660s`：
+
+```bash
+M_ASR_EVAL_MEETINGS=EN2001a \
+M_ASR_EVAL_START_SECONDS=60 \
+M_ASR_EVAL_WARMUP_SECONDS=60 \
+M_ASR_EVAL_MAX_SECONDS=600 \
+M_ASR_EVAL_OUTPUT_DIR=eval/ami_array1_01_EN2001a_10min_warmup60 \
+bash scripts/eval_ami_quick.sh
+```
+
+评测分三步，也可以分开执行：
+
+```bash
+PY=/root/.conda/envs/pyannote/bin/python
+$PY scripts/ami_prepare_refs.py --data-root /root/shared-nvme/yuxinliu/data_a --output-dir eval/ami_array1_01_quick/refs --meetings EN2001a --start-seconds 60 --max-seconds 300
+$PY scripts/eval_run_ami.py --manifest eval/ami_array1_01_quick/refs/manifest.jsonl --output-dir eval/ami_array1_01_quick/pred --meetings EN2001a --start-seconds 60 --max-seconds 300 --warmup-seconds 60
+$PY scripts/eval_metrics.py --ref-jsonl eval/ami_array1_01_quick/refs/ref.jsonl --hyp-jsonl eval/ami_array1_01_quick/pred/pred.jsonl --ref-rttm eval/ami_array1_01_quick/refs/ref.rttm --hyp-rttm eval/ami_array1_01_quick/pred/pred.rttm --output-json eval/ami_array1_01_quick/metrics.json
+```
+
+`eval_metrics.py` 默认使用 `--audio-scope strict`，会检查 reference 和 prediction 的 `audio_id` 是否完全一致。不一致时会直接报错，避免把未跑完的会议算成完全漏检。如果只是临时查看已完成会议的局部结果，可以显式加：
+
+```bash
+$PY scripts/eval_metrics.py ... --audio-scope intersection
+```
+
+如果单会议预测已经存在，需要重新聚合 `pred.jsonl/pred.rttm`：
+
+```bash
+$PY scripts/eval_run_ami.py --collect-only --manifest eval/ami_array1_01_quick/refs/manifest.jsonl --output-dir eval/ami_array1_01_quick/pred
+```
 
 ## 文档
 
