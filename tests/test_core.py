@@ -4,6 +4,7 @@ from m_asr.chunker import SpeechChunker
 from m_asr.config import AppConfig
 from m_asr.diarization.speaker_registry import SpeakerRegistry
 from m_asr.types import AudioChunk
+from m_asr.web_app import _select_streaming_final_text
 
 
 def test_chunker_emits_speech_chunk():
@@ -66,3 +67,15 @@ def test_config_defaults_to_real_backends():
     assert config.speaker.mode == "real"
     assert config.runtime.device == "cuda"
     assert config.runtime.asr_provider == "auto"
+
+
+def test_streaming_final_text_keeps_longer_partial_when_finish_drops_tail():
+    text = _select_streaming_final_text("今天天气很", "今天天气很好")
+
+    assert text == "今天天气很好"
+
+
+def test_streaming_final_text_prefers_finished_when_it_extends_partial():
+    text = _select_streaming_final_text("今天天气很好", "今天天气很")
+
+    assert text == "今天天气很好"

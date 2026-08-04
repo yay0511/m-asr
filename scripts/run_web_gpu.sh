@@ -5,7 +5,7 @@ ROOT="${M_ASR_ROOT:-/root/shared-nvme/yuxinliu/m_asr}"
 PYANNOTE_PYTHON="${PYANNOTE_GPU_PYTHON:-/root/.conda/envs/pyannote/bin/python}"
 
 export M_ASR_DEVICE="${M_ASR_DEVICE:-cuda}"
-export M_ASR_ASR_PROVIDER="${M_ASR_ASR_PROVIDER:-cuda}"
+export M_ASR_ASR_PROVIDER="${M_ASR_ASR_PROVIDER:-auto}"
 export PYTHONPATH="$ROOT/src:${X_ASR_ROOT:-/root/shared-nvme/yuxinliu/X-ASR}:${PYANNOTE_AUDIO_ROOT:-/root/shared-nvme/yuxinliu/pyannote-audio-4.0.7}/src:${PYTHONPATH:-}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/m_asr_matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
@@ -37,10 +37,18 @@ for lib_path in "${CUDA_LIB_PATHS[@]}"; do
 done
 
 "$PYANNOTE_PYTHON" - <<'PY'
+from pathlib import Path
 import sys
 import torch
 
 print(f"[web-gpu] torch={torch.__version__} cuda_build={torch.version.cuda}")
+if not list(Path("/dev").glob("nvidia*")):
+    print(
+        "[web-gpu] no /dev/nvidia* devices are visible in this container; "
+        "start this environment with GPU access before launching the GPU web server.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 if not torch.cuda.is_available():
     print("[web-gpu] CUDA is not available; refusing to start GPU web server.", file=sys.stderr)
     raise SystemExit(2)

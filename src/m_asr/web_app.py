@@ -21,7 +21,7 @@ import numpy as np
 from .config import load_config
 from .main import read_wav
 from .pipeline import StreamingCascadePipeline
-from .types import PipelineEvent, TranscriptTurn
+from .types import AudioChunk, PipelineEvent, TranscriptTurn
 
 
 LIVE_HTML_PAGE = """<!doctype html>
@@ -1031,7 +1031,16 @@ def _runtime_warning(config: Any, realtime: bool) -> str:
             f"{flow}中 X-ASR 正在使用 CUDA；"
             "speaker embedding 当前使用 CPU，因为 torch CUDA 不可用或 pyannote 已回退。"
         )
+    gpu_issue = _visible_gpu_issue()
+    if gpu_issue:
+        return f"{flow}当前使用 CPU；{gpu_issue}"
     return f"{flow}当前使用 CPU；请检查 torch CUDA、GPU 设备和 sherpa-onnx CUDA provider。"
+
+
+def _visible_gpu_issue() -> str:
+    if not list(Path("/dev").glob("nvidia*")):
+        return "当前容器没有可见的 /dev/nvidia* 设备，请确认启动环境时已挂载 GPU。"
+    return ""
 
 
 def transcribe_file(path: Path, config_path: str) -> dict[str, Any]:
@@ -1066,8 +1075,10 @@ class WebSocketClosed(Exception):
 class LiveWebSocketSession:
     def __init__(self, handler: WebAsrHandler, config_path: str):
         self.handler = handler
-        self.config = load_config(config_path)
-        self.pipeline = StreamingCascadePipeline(self.config)
+        started = time.perf_counter()
+        self.pipeline, self.preloaded = _take_preloaded_live_pipeline(handler, config_path)
+        self.init_ms = (time.perf_counter() - started) * 1000.0
+        self.config = self.pipeline.config
         self.asr_stream = self.pipeline.asr.create_streaming_session()
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.sample_rate = self.config.runtime.sample_rate
@@ -1092,6 +1103,8 @@ class LiveWebSocketSession:
                 },
                 "sample_rate": self.sample_rate,
                 "warning": warning,
+                "preloaded": self.preloaded,
+                "init_ms": self.init_ms,
             },
         )
 
@@ -1188,7 +1201,7 @@ class LiveWebSocketSession:
             self._finalize_streaming_chunk(chunk)
 
     def _finalize_streaming_chunk(self, chunk: Any) -> None:
-        final_text = self.asr_stream.finish() or self.current_text
+        final_text = _select_streaming_final_text(self.asr_stream.finish(), self.current_text)
         if final_text:
             _ws_send_json(
                 self.handler,
@@ -1215,7 +1228,7 @@ class LiveWebSocketSession:
         self.current_text = ""
 
     def _finalize_current_asr(self, end_time: float) -> None:
-        final_text = self.asr_stream.finish() or self.current_text
+        final_text = _select_streaming_final_text(self.asr_stream.finish(), self.current_text)
         if final_text:
             _ws_send_json(
                 self.handler,
@@ -1289,6 +1302,71 @@ class LiveWebSocketSession:
                 },
             )
         self._speaker_futures = remaining
+
+
+def _select_streaming_final_text(finished_text: str, partial_text: str) -> str:
+    finished = (finished_text or "").strip()
+    partial = (partial_text or "").strip()
+    if not finished:
+        return partial
+    if not partial:
+        return finished
+
+    normalized_finished = _compact_for_prefix_match(finished)
+    normalized_partial = _compact_for_prefix_match(partial)
+    if normalized_partial.startswith(normalized_finished) and len(normalized_partial) > len(normalized_finished):
+        return partial
+    if normalized_finished.startswith(normalized_partial):
+        return finished
+    return finished
+
+
+def _compact_for_prefix_match(text: str) -> str:
+    return "".join(char.lower() for char in text if char.isalnum() or "\u3400" <= char <= "\u9fff")
+
+
+def _take_preloaded_live_pipeline(
+    handler: WebAsrHandler,
+    config_path: str,
+) -> tuple[StreamingCascadePipeline, bool]:
+    pipeline = getattr(handler.server, "preloaded_live_pipeline", None)
+    if pipeline is not None:
+        handler.server.preloaded_live_pipeline = None  # type: ignore[attr-defined]
+        return pipeline, True
+    return StreamingCascadePipeline(load_config(config_path)), False
+
+
+def _preload_live_pipeline(config_path: str) -> StreamingCascadePipeline:
+    started = time.perf_counter()
+    pipeline = StreamingCascadePipeline(load_config(config_path))
+    _warmup_live_pipeline(pipeline)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    print(f"[web] preloaded realtime pipeline in {elapsed_ms:.0f} ms")
+    return pipeline
+
+
+def _warmup_live_pipeline(pipeline: StreamingCascadePipeline) -> None:
+    samples = np.zeros(
+        max(1, int(round(pipeline.config.runtime.sample_rate * 0.8))),
+        dtype=np.float32,
+    )
+    try:
+        stream = pipeline.asr.create_streaming_session()
+        stream.accept_waveform(samples, pipeline.config.runtime.sample_rate)
+        stream.reset()
+    except Exception as exc:
+        print(f"[warn] ASR warmup failed: {type(exc).__name__}: {exc}")
+    try:
+        chunk = AudioChunk(
+            chunk_id=-1,
+            start=0.0,
+            end=samples.size / pipeline.config.runtime.sample_rate,
+            waveform=samples,
+            sample_rate=pipeline.config.runtime.sample_rate,
+        )
+        pipeline.embedder.extract(chunk)
+    except Exception as exc:
+        print(f"[warn] speaker warmup failed: {type(exc).__name__}: {exc}")
 
 
 def _ws_read_exact(handler: WebAsrHandler, size: int) -> bytes:
@@ -1404,10 +1482,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--config", default="configs/local.yaml")
+    parser.add_argument(
+        "--no-preload",
+        action="store_true",
+        help="load ASR/diarization models on first WebSocket connection instead of server startup",
+    )
     args = parser.parse_args(argv)
 
     server = ThreadingHTTPServer((args.host, args.port), WebAsrHandler)
     server.config_path = args.config  # type: ignore[attr-defined]
+    server.preloaded_live_pipeline = None  # type: ignore[attr-defined]
+    if not args.no_preload:
+        print("[web] preloading realtime pipeline")
+        server.preloaded_live_pipeline = _preload_live_pipeline(args.config)  # type: ignore[attr-defined]
     print(f"[web] serving http://{args.host}:{args.port}")
     try:
         server.serve_forever()

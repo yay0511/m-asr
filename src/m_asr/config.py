@@ -39,7 +39,7 @@ class ChunkerConfig:
     min_chunk_duration: float = 0.35
     max_chunk_duration: float = 1.8
     left_padding_ms: int = 200
-    right_padding_ms: int = 80
+    right_padding_ms: int = 200
 
 
 @dataclass(slots=True)

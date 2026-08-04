@@ -24,7 +24,7 @@ chunker:
   min_chunk_duration: 0.35
   max_chunk_duration: 1.8
   left_padding_ms: 200
-  right_padding_ms: 80
+  right_padding_ms: 200
 
 speaker:
   same_speaker_threshold: 0.68
