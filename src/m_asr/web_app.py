@@ -910,6 +910,7 @@ class WebAsrHandler(BaseHTTPRequestHandler):
             encoded = LIVE_HTML_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("cache-control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("content-length", str(len(encoded)))
             self.end_headers()
             return
@@ -917,12 +918,14 @@ class WebAsrHandler(BaseHTTPRequestHandler):
             encoded = HTML_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("cache-control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("content-length", str(len(encoded)))
             self.end_headers()
             return
         if self.path == "/health":
             self.send_response(HTTPStatus.OK)
             self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("cache-control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
             return
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
@@ -1002,14 +1005,16 @@ class WebAsrHandler(BaseHTTPRequestHandler):
         encoded = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("cache-control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
 
-def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
+    def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
         encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("cache-control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("content-length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
