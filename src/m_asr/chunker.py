@@ -103,6 +103,8 @@ class SpeechChunker:
         self._preroll: deque[np.ndarray] = deque(maxlen=self._left_padding_frames)
         self._current: list[np.ndarray] = []
         self._chunk_start_sample = 0
+        self._speech_start_sample = 0
+        self._speech_end_sample = 0
         self._silence_samples = 0
         self._buffer.clear()
         if self._vad is not None:
@@ -177,16 +179,21 @@ class SpeechChunker:
         if self.state is ChunkerState.TRIGGERED:
             return
         self._chunk_start_sample = max(0, start_sample - self.left_padding_samples)
+        self._speech_start_sample = start_sample
+        self._speech_end_sample = start_sample
         self.state = ChunkerState.TRIGGERED
 
     def _on_silero_end(self, end_sample: int) -> AudioChunk | None:
         if self.state is not ChunkerState.TRIGGERED:
             return None
+        self._speech_end_sample = end_sample
         return self._finalize_silero(end_sample + self.right_padding_samples)
 
     def _finalize_silero(self, end_sample: int) -> AudioChunk | None:
         start_sample = self._chunk_start_sample
         end = min(max(end_sample, start_sample), self._buffer.absolute_end_sample)
+        if self._speech_end_sample <= self._speech_start_sample:
+            self._speech_end_sample = end
         waveform = self._buffer.get_range(start_sample, end)
         self.state = ChunkerState.IDLE
         self._chunk_start_sample = 0
@@ -201,7 +208,11 @@ class SpeechChunker:
             waveform=waveform,
             sample_rate=self.sample_rate,
             is_final=True,
+            core_start=self._speech_start_sample / self.sample_rate,
+            core_end=(self._speech_end_sample or start_sample + waveform.size) / self.sample_rate,
         )
+        self._speech_start_sample = 0
+        self._speech_end_sample = 0
         self.chunk_id += 1
         return chunk
 
@@ -304,6 +315,8 @@ class SpeechChunker:
             waveform=waveform,
             sample_rate=self.sample_rate,
             is_final=True,
+            core_start=start_sample / self.sample_rate,
+            core_end=end_sample / self.sample_rate,
         )
         self.chunk_id += 1
         return chunk

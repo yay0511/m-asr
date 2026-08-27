@@ -110,5 +110,20 @@ class AudioBuffer:
             waveform=samples,
         )
 
+    @property
+    def start_time(self) -> float:
+        return self.ring.absolute_start_sample / self.sample_rate
+
+    @property
+    def end_time(self) -> float:
+        return self.ring.absolute_end_sample / self.sample_rate
+
+    def get_available_range_seconds(self, start: float, end: float) -> tuple[float, float, np.ndarray]:
+        actual_start = max(float(start), self.start_time)
+        actual_end = min(float(end), self.end_time)
+        if actual_end <= actual_start:
+            return actual_start, actual_start, np.zeros(0, dtype=np.float32)
+        return actual_start, actual_end, self.get_range_seconds(actual_start, actual_end)
+
     def get_range_seconds(self, start: float, end: float) -> np.ndarray:
         return self.ring.get_range(int(round(start * self.sample_rate)), int(round(end * self.sample_rate)))

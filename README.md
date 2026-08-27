@@ -14,9 +14,10 @@ Browser microphone
 -> AudioBuffer
 -> Silero VAD SpeechChunker endpoint
 -> final text
--> pyannote speaker embedding
--> SpeakerRegistry
--> patch speaker id in Transcript
+-> parallel local pyannote + Paraformer timestamp branches
+-> local-to-global SpeakerRegistry + word overlap alignment
+-> assign every timestamped word to a speaker segment
+-> render multiple speaker runs in Transcript
 ```
 
 文件上传页面 `/upload` 和命令行 WAV 处理：
@@ -39,9 +40,10 @@ WAV / waveform
 - WebSocket 实时话筒输入，浏览器端重采样为 16k PCM 发送
 - X-ASR 长期 streaming session，音频帧进入后立即产出 partial 文本
 - 基于 Silero VAD 的流式 SpeechChunker，用于切句和 endpoint
-- 真实 pyannote speaker embedding
+- 真实 pyannote segmentation、local mask、masked embedding 和在线 local-to-global speaker matching
+- 本地 Paraformer-zh 时间戳支线，不替换 X-ASR 主文本
 - 在线 SpeakerRegistry：动态新建 speaker 阈值、last-speaker bias、低置信分配但不更新 centroid
-- Web Transcript：先显示文字，speaker 确定后补 speaker id；相邻同 speaker 片段会合并显示
+- Web Transcript：先显示文字，speaker 确定后按 word 时间戳回写；一个 chunk 内多个 speaker 会分别显示
 - 文件上传和命令行 WAV 演示
 
 ## 快速运行
@@ -94,6 +96,7 @@ configs/local.yaml
 /root/shared-nvme/yuxinliu/X-ASR
 /root/shared-nvme/yuxinliu/pyannote-audio-4.0.7
 /root/shared-nvme/yuxinliu/pyannote-speaker-diarization-community-1
+/root/shared-nvme/yuxinliu/paraformer-zh
 ```
 
 外部目录只读引用，不复制进本项目，也不直接修改。

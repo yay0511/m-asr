@@ -2,19 +2,25 @@
 
 ## 目标
 
-当前项目实现两条入口：
+当前项目实现两条入口，使用同一套流式主线：
 
 ```text
-Web realtime:
-Browser mic -> /ws/live -> X-ASR streaming partials
-                         -> Silero endpoint -> pyannote embedding -> speaker id patch
-
-CLI / upload:
-WAV -> AudioBuffer -> Silero SpeechChunker -> chunk-level X-ASR
-                                       \-> pyannote embedding -> SpeakerRegistry
+Browser mic / WAV
+        |
+        v
+AudioBuffer (16 kHz, rolling 60 s, absolute timeline)
+        |
+        +--> X-ASR streaming decoder --> partial / final display text
+        +--> Silero VAD --> finalized speech chunk + core speech range
+        +--> Paraformer-zh --> character/word timestamps
+        +--> pyannote segmentation --> local speaker masks --> masked embeddings
+                                                       --> online SpeakerRegistry
+        |
+        v
+timestamp + global speaker overlap alignment --> Transcript
 ```
 
-Web 话筒路径的目标是“说多少出多少”：X-ASR streaming session 在音频帧进入时持续返回 partial 文本；一段语音被 Silero VAD 判定结束后，再生成 final 文本并异步补说话人。CLI 和文件上传路径仍然按 chunk 级级联处理。
+X-ASR 是网页的主文本通路，持续输出 partial。Silero 只负责 endpoint 和生成可提交的语音 chunk，不阻塞 X-ASR。Paraformer 和 pyannote 在 chunk finalize 后并行运行；Paraformer 只提供时间戳，不替换网页主文本。局部 Pyannote label 只在当前 chunk 内有效，随后由 `SpeakerRegistry` 映射为长期全局 `SPEAKER_N`。
 
 ## 关键模块
 
@@ -24,7 +30,9 @@ Web 话筒路径的目标是“说多少出多少”：X-ASR streaming session �
 
 - `AudioChunk`
 - `AsrResult`
-- `SpeakerResult`
+- `TimestampedWord`
+- `LocalSpeakerSegment` / `LocalSpeakerTrack`
+- `LocalDiarizationResult`
 - `TranscriptTurn`
 - `PipelineEvent`
 
@@ -96,19 +104,33 @@ asr:
 
 依赖或模型不可用时会报错。
 
-### `m_asr.diarization.pyannote_embedder`
+### `m_asr.asr.paraformer_timestamp`
 
-`PyannoteSpeakerEmbedder` 封装真实 pyannote speaker embedding。
-
-默认加载：
+`ParaformerTimestampClient` 是独立的时间戳支线，加载本地：
 
 ```text
+/root/shared-nvme/yuxinliu/paraformer-zh
+```
+
+它对 finalized chunk 调用 FunASR `AutoModel.generate(..., pred_timestamp=True)`，把返回的 timestamp 转成字符和中文字符级 fallback word 时间。随后用文本相似度与 X-ASR final text 对齐；不匹配时只丢弃时间戳，不替换 X-ASR 文本。该支线不可用时主 ASR/diarization 仍可工作，并在 Web ready warning 中提示安装 FunASR。
+
+### `m_asr.diarization.local_pyannote`
+
+`ChunkLocalPyannoteDiarizer` 尽量复用 pyannote.audio 源码中的模型组件，但不调用 offline global clustering。默认加载：
+
+```text
+/root/shared-nvme/yuxinliu/pyannote-speaker-diarization-community-1/segmentation
 /root/shared-nvme/yuxinliu/pyannote-speaker-diarization-community-1/embedding
 ```
 
-识别时会把 `AudioChunk.waveform` reshape 成 pyannote 需要的张量格式并提取 embedding。小于 `speaker.min_embedding_duration` 的 chunk 会返回 `None`，避免把太短片段用于不可靠的 speaker 判断。
+每个 finalized chunk 会取少量上下文，并执行：
 
-如果用户请求 CUDA 但当前 torch CUDA 不可用，或 CUDA 在模型加载/推理时触发 driver 错误，代码会打印 warning 并切到 CPU 重试。
+1. `Model.from_pretrained` + `Inference` 得到 local speaker activity。
+2. 对各 local channel 使用 onset/offset 阈值生成局部 segments。
+3. 将局部 mask 传入 `PretrainedSpeakerEmbedding(...)(waveform, masks=...)`，得到 masked embedding。
+4. 可选移除 overlap frame，再返回 `LocalDiarizationResult`。
+
+局部 label 只在当前 chunk 内有效；它们不会直接成为网页上的全局 speaker id。CUDA 不可用时会使用 CPU，并由启动状态显示实际设备。
 
 ### `m_asr.diarization.speaker_registry`
 
@@ -121,13 +143,12 @@ asr:
 
 匹配流程：
 
-1. embedding 做 L2 normalize
-2. 和所有 speaker centroid 计算 cosine similarity
-3. 优先检查上一个 speaker：达到 `last_speaker_threshold` 且和最优 speaker 差距不超过 `last_speaker_margin` 时，继续沿用上一个 speaker
-4. 否则最佳相似度超过 `same_speaker_threshold` 时匹配已有 speaker
-5. 如果不满足已有 speaker 匹配，再根据动态新建阈值判断是否允许创建新 speaker
-6. 已有 speaker 且结果不确定时，默认分配给最佳已有 speaker，减少 `UNKNOWN`
-7. 只有满足 `min_centroid_update_similarity`、`min_embedding_duration`、`min_update_confidence` 的高置信 chunk 才更新 centroid
+1. local track 按有效语音时长降序处理。
+2. embedding 做 L2 normalize，与所有 global centroid 计算 cosine similarity。
+3. 当前 chunk 内一个 global profile 只能被一个 local track 占用，避免局部多人合并到同一个全局 speaker。
+4. 先检查上一个 speaker 的 `local_last_speaker_threshold`，再检查一般的 `local_match_threshold`。
+5. 无法匹配时，只有持续时间足够且与已有 profile 足够远才新建 speaker；不确定结果默认回退到最佳已有 profile，减少 `UNKNOWN`。
+6. 只有高相似度 track 才更新 centroid。
 
 流式开头使用更保守的新建 speaker 策略：`new_speaker_initial_max_similarity` 和 `min_new_speaker_duration_initial` 会随着 `new_speaker_warmup_seconds` 逐步过渡到 final 配置，降低刚开始 embedding 漂移导致频繁新建 speaker 的概率。
 
@@ -137,16 +158,20 @@ asr:
 
 ```text
 AudioBuffer -> SpeechChunker -> XAsrClient
-                          \-> PyannoteSpeakerEmbedder -> SpeakerRegistry
-                          \-> TranscriptTurn
+                          +-> local pyannote -> SpeakerRegistry
+                          +-> ParaformerTimestampClient -> word timestamps
+                          +-> TranscriptTurn
 ```
 
-每个 finalized chunk 内，ASR 和 speaker embedding 使用线程池并发执行。事件顺序：
+每个 finalized chunk 内，X-ASR、local pyannote 和 Paraformer 使用线程池并发执行；registry 更新按 chunk 顺序进行。事件顺序：
 
 1. `chunk_finalized`
 2. `partial`：先输出 `UNKNOWN: text`
-3. `speaker`：输出匹配到的 `SPEAKER_N`
-4. `final`：输出带 speaker id 的最终 turn
+3. `speaker`：输出当前 chunk 内全部 local-to-global speaker segments；多个 speaker 时事件的 `speaker_id` 为 `MULTI`
+4. `timestamp`：输出每个 word 的时间和 speaker id
+5. `final`：输出带完整 word metadata 的 chunk final text
+
+最终 transcript 不再把一个 chunk 压缩成一个 speaker。Paraformer 的每个 word 与全部 global speaker segments 做时间重叠匹配，连续同 speaker 的 words 被合并成独立 turn。因此一个 chunk 可以产生多个 transcript turns。
 
 这条路径是 chunk-level streaming cascade，不是 token-level realtime decoding。
 
@@ -168,7 +193,7 @@ browser 100ms PCM frame
 -> emit partial immediately
 -> AudioBuffer.append()
 -> SpeechChunker.accept()
--> on endpoint: final text + speaker future
+-> on endpoint: final text + local diarization / timestamp futures
 -> emit speaker/final events
 ```
 
@@ -210,7 +235,7 @@ chunker:
   min_chunk_duration: 0.35
   max_chunk_duration: 1.8
   left_padding_ms: 200
-  right_padding_ms: 80
+  right_padding_ms: 200
 ```
 
 Speaker matching：
@@ -230,6 +255,10 @@ speaker:
   min_embedding_duration: 0.7
   min_update_confidence: 0.6
   assign_uncertain_to_best: true
+  local_match_threshold: 0.72
+  local_last_speaker_threshold: 0.54
+  local_last_speaker_margin: 0.10
+  local_new_speaker_threshold: 0.72
 ```
 
 真实模型：
@@ -240,6 +269,35 @@ asr:
 speaker:
   mode: real
 ```
+
+新增支线配置：
+
+```yaml
+local_pyannote:
+  enabled: true
+  left_context_seconds: 0.8
+  right_context_seconds: 0.4
+  segmentation_threshold: 0.50
+  segmentation_offset: 0.40
+  min_local_speaker_duration: 0.35
+  exclude_overlap: true
+
+timestamp_asr:
+  enabled: true
+  device: cuda
+  pred_timestamp: true
+
+audio_buffer:
+  retention_seconds: 60.0
+```
+
+Paraformer 时间戳支线需要在实际运行的 `pyannote` 环境安装 FunASR：
+
+```bash
+python -m pip install funasr
+```
+
+如果未安装，X-ASR 和 Pyannote 主流程仍可运行，但 Web ready 事件会标记 timestamp branch unavailable。
 
 ## 运行方式
 

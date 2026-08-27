@@ -3,6 +3,7 @@ paths:
   pyannote_audio_root: /root/shared-nvme/yuxinliu/pyannote-audio-4.0.7
   pyannote_model_dir: /root/shared-nvme/yuxinliu/pyannote-speaker-diarization-community-1
   x_asr_model_dir: /root/shared-nvme/yuxinliu/X-ASR/X-ASR-zh-en/deployment/models/chunk-960ms-model
+  paraformer_model_dir: /root/shared-nvme/yuxinliu/paraformer-zh
 
 runtime:
   sample_rate: 16000
@@ -41,6 +42,39 @@ speaker:
   min_update_confidence: 0.6
   assign_uncertain_to_best: true
   mode: real
+  local_match_threshold: 0.72
+  local_last_speaker_threshold: 0.54
+  local_last_speaker_margin: 0.10
+  local_new_speaker_threshold: 0.72
+  local_min_track_duration: 0.45
+
+local_pyannote:
+  enabled: true
+  left_context_seconds: 0.8
+  right_context_seconds: 0.4
+  segmentation_threshold: 0.50
+  segmentation_offset: 0.40
+  min_local_speaker_duration: 0.35
+  min_embedding_duration: 0.70
+  max_local_speakers: 3
+  exclude_overlap: true
+
+timestamp_asr:
+  enabled: true
+  device: cuda
+  pred_timestamp: true
+  use_for_display: false
+  max_workers: 1
+  min_chunk_duration: 0.5
+
+audio_buffer:
+  retention_seconds: 60.0
+
+transcript:
+  rewrite_window_seconds: 10.0
+  lock_delay_seconds: 10.0
+  min_speaker_run_words: 2
+  min_speaker_run_duration: 0.35
 
 asr:
   mode: real

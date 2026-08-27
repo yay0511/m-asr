@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 asr = [
+    "funasr>=1.2.6",
     "sherpa-onnx>=1.13.2",
     "sherpa-onnx-core>=1.13.2",
 ]

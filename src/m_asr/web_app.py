@@ -20,7 +20,14 @@ import numpy as np
 
 from .config import load_config
 from .main import read_wav
-from .pipeline import StreamingCascadePipeline
+from .pipeline import (
+    StreamingCascadePipeline,
+    _attach_speakers,
+    _display_speaker,
+    _segment_to_dict,
+    _word_to_dict,
+    _words_to_turns,
+)
 from .types import AudioChunk, PipelineEvent, TranscriptTurn
 
 
@@ -309,7 +316,22 @@ LIVE_HTML_PAGE = """<!doctype html>
         }
         if (message.event.event_type === 'speaker') {
           const previous = turns.get(message.event.chunk_id) || message.event;
-          turns.set(message.event.chunk_id, { ...previous, speaker_id: message.event.speaker_id || '', confidence: message.event.confidence });
+          turns.set(message.event.chunk_id, {
+            ...previous,
+            speaker_id: message.event.speaker_id || '',
+            confidence: message.event.confidence,
+            speaker_segments: message.event.speaker_segments || [],
+            words: message.event.words || previous.words || []
+          });
+          renderTranscript();
+        }
+        if (message.event.event_type === 'timestamp') {
+          const previous = turns.get(message.event.chunk_id) || message.event;
+          turns.set(message.event.chunk_id, {
+            ...previous,
+            words: message.event.words || [],
+            speaker_segments: message.event.speaker_segments || previous.speaker_segments || []
+          });
           renderTranscript();
         }
         if (message.event.event_type === 'final') {
@@ -329,7 +351,25 @@ LIVE_HTML_PAGE = """<!doctype html>
 
     function mergeTranscriptTurns(items) {
       const merged = [];
+      const expanded = [];
       for (const turn of items) {
+        if (Array.isArray(turn.words) && turn.words.length) {
+          let run = null;
+          for (const word of turn.words) {
+            const speaker = word.speaker_id && word.speaker_id !== 'UNKNOWN' ? word.speaker_id : '';
+            if (run && run.speaker_id === speaker && word.start - run.end <= 1.0) {
+              run.end = Math.max(run.end, word.end);
+              run.text = joinText(run.text, word.text);
+            } else {
+              run = { ...turn, start: word.start, end: word.end, text: word.text, speaker_id: speaker };
+              expanded.push(run);
+            }
+          }
+        } else {
+          expanded.push(turn);
+        }
+      }
+      for (const turn of expanded) {
         if (!turn.text) continue;
         const speaker = turn.speaker_id && turn.speaker_id !== 'UNKNOWN' ? turn.speaker_id : '';
         const normalized = { ...turn, speaker_id: speaker };
@@ -800,7 +840,25 @@ HTML_PAGE = """<!doctype html>
 
     function mergeTurns(turns) {
       const merged = [];
+      const expanded = [];
       for (const turn of turns) {
+        if (Array.isArray(turn.words) && turn.words.length) {
+          let run = null;
+          for (const word of turn.words) {
+            const speaker = word.speaker_id && word.speaker_id !== 'UNKNOWN' ? word.speaker_id : '';
+            if (run && run.speaker_id === speaker && word.start - run.end <= 1.0) {
+              run.end = Math.max(run.end, word.end);
+              run.text = joinText(run.text, word.text);
+            } else {
+              run = { ...turn, start: word.start, end: word.end, text: word.text, speaker_id: speaker };
+              expanded.push(run);
+            }
+          }
+        } else {
+          expanded.push(turn);
+        }
+      }
+      for (const turn of expanded) {
         if (!turn.text) continue;
         const speaker = turn.speaker_id && turn.speaker_id !== 'UNKNOWN' ? turn.speaker_id : '';
         const normalized = { ...turn, speaker_id: speaker };
@@ -1057,6 +1115,8 @@ def transcribe_file(path: Path, config_path: str) -> dict[str, Any]:
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     warning = _runtime_warning(config, realtime=False)
+    if pipeline.timestamp_asr.init_error:
+        warning = f"{warning} {pipeline.timestamp_asr.init_error}".strip()
     if not any(event.event_type == "chunk_finalized" for event in events):
         warning = "没有切出语音 chunk；请检查音频音量或 chunker.energy_reference。"
     elif not pipeline.transcript:
@@ -1090,10 +1150,13 @@ class LiveWebSocketSession:
         self.live_chunk_id = 0
         self.current_start = 0.0
         self.current_text = ""
-        self._speaker_futures: list[tuple[Any, str, Future[Any]]] = []
+        self._speaker_futures: list[tuple[Any, str, Future[Any], Future[Any]]] = []
+        self._timestamp_futures: list[tuple[Any, str, Future[Any], list[Any]]] = []
 
     def run(self) -> None:
         warning = _runtime_warning(self.config, realtime=True)
+        if self.pipeline.timestamp_asr.init_error:
+            warning = f"{warning} {self.pipeline.timestamp_asr.init_error}".strip()
         _ws_send_json(
             self.handler,
             {
@@ -1225,8 +1288,9 @@ class LiveWebSocketSession:
                     ),
                 },
             )
-            future = self.executor.submit(self.pipeline._identify_speaker, chunk)
-            self._speaker_futures.append((chunk, final_text, future))
+            local_future = self.executor.submit(self.pipeline.analyze_local, chunk)
+            timestamp_future = self.executor.submit(self.pipeline.analyze_timestamp, chunk)
+            self._speaker_futures.append((chunk, final_text, local_future, timestamp_future))
         self.asr_stream.reset()
         self.live_chunk_id = chunk.chunk_id + 1
         self.current_start = chunk.end
@@ -1256,13 +1320,15 @@ class LiveWebSocketSession:
         self.current_text = ""
 
     def _drain_speaker_futures(self, wait: bool) -> None:
-        remaining: list[tuple[Any, str, Future[Any]]] = []
-        for chunk, text, future in self._speaker_futures:
-            if not wait and not future.done():
-                remaining.append((chunk, text, future))
-                continue
+        remaining: list[tuple[Any, str, Future[Any], Future[Any]]] = []
+        for index, (chunk, text, local_future, timestamp_future) in enumerate(self._speaker_futures):
+            if not wait and not local_future.done():
+                remaining.extend(self._speaker_futures[index:])
+                break
             try:
-                speaker_result = future.result()
+                local_result = local_future.result()
+                speaker_segments, _ = self.pipeline.registry.assign_local_tracks(local_result)
+                speaker_id, speaker_confidence = _display_speaker([], speaker_segments)
             except Exception as exc:
                 _ws_send_json(
                     self.handler,
@@ -1281,15 +1347,39 @@ class LiveWebSocketSession:
                 )
                 continue
 
-            self.pipeline.transcript.append(
-                TranscriptTurn(
-                    start=chunk.start,
-                    end=chunk.end,
-                    speaker_id=speaker_result.speaker_id,
-                    text=text,
-                    confidence=speaker_result.confidence,
-                )
-            )
+            words = []
+            timestamp_result = None
+            if timestamp_future.done() or wait:
+                try:
+                    timestamp_result = self.pipeline._align_timestamp(text, timestamp_future.result())
+                    words = _attach_speakers(
+                        timestamp_result.words,
+                        speaker_segments,
+                        min_run_words=self.config.transcript.min_speaker_run_words,
+                        min_run_duration=self.config.transcript.min_speaker_run_duration,
+                    )
+                except Exception as exc:
+                    _ws_send_json(
+                        self.handler,
+                        {
+                            "type": "event",
+                            "event": _event_to_dict(
+                                PipelineEvent(
+                                    "error",
+                                    chunk.chunk_id,
+                                    chunk.start,
+                                    chunk.end,
+                                    message=f"timestamp branch failed: {type(exc).__name__}: {exc}",
+                                )
+                            ),
+                        },
+                    )
+            else:
+                self._timestamp_futures.append((chunk, text, timestamp_future, speaker_segments))
+
+            turns = _words_to_turns(chunk, text, words, speaker_id, speaker_confidence)
+            self.pipeline.transcript.extend(turns)
+            event_speaker, event_confidence = _display_speaker(words, speaker_segments)
             _ws_send_json(
                 self.handler,
                 {
@@ -1300,13 +1390,86 @@ class LiveWebSocketSession:
                             chunk.chunk_id,
                             chunk.start,
                             chunk.end,
-                            speaker_id=speaker_result.speaker_id,
-                            confidence=speaker_result.confidence,
+                            speaker_id=event_speaker,
+                            confidence=event_confidence,
+                            text=text,
+                            words=[_word_to_dict(word) for word in words],
+                            speaker_segments=[_segment_to_dict(segment) for segment in speaker_segments],
                         )
                     ),
                 },
             )
+            if words and timestamp_result is not None:
+                _ws_send_json(
+                    self.handler,
+                    {
+                        "type": "event",
+                        "event": _event_to_dict(
+                            PipelineEvent(
+                                "timestamp",
+                                chunk.chunk_id,
+                                chunk.start,
+                                chunk.end,
+                                text=timestamp_result.text,
+                                words=[_word_to_dict(word) for word in words],
+                                timestamp_status=timestamp_result.status,
+                            )
+                        ),
+                    },
+                )
         self._speaker_futures = remaining
+        self._drain_timestamp_futures(wait=wait)
+
+    def _drain_timestamp_futures(self, wait: bool) -> None:
+        remaining: list[tuple[Any, str, Future[Any], list[Any]]] = []
+        for index, (chunk, text, future, speaker_segments) in enumerate(self._timestamp_futures):
+            if not wait and not future.done():
+                remaining.extend(self._timestamp_futures[index:])
+                break
+            try:
+                result = self.pipeline._align_timestamp(text, future.result())
+                words = _attach_speakers(
+                    result.words,
+                    speaker_segments,
+                    min_run_words=self.config.transcript.min_speaker_run_words,
+                    min_run_duration=self.config.transcript.min_speaker_run_duration,
+                )
+                if words:
+                    _ws_send_json(
+                        self.handler,
+                        {
+                            "type": "event",
+                            "event": _event_to_dict(
+                                PipelineEvent(
+                                    "timestamp",
+                                    chunk.chunk_id,
+                                    chunk.start,
+                                    chunk.end,
+                                    text=result.text,
+                                    words=[_word_to_dict(word) for word in words],
+                                    speaker_segments=[_segment_to_dict(segment) for segment in speaker_segments],
+                                    timestamp_status=result.status,
+                                )
+                            ),
+                        },
+                    )
+            except Exception as exc:
+                _ws_send_json(
+                    self.handler,
+                    {
+                        "type": "event",
+                        "event": _event_to_dict(
+                            PipelineEvent(
+                                "error",
+                                chunk.chunk_id,
+                                chunk.start,
+                                chunk.end,
+                                message=f"timestamp branch failed: {type(exc).__name__}: {exc}",
+                            )
+                        ),
+                    },
+                )
+        self._timestamp_futures = remaining
 
 
 def _select_streaming_final_text(finished_text: str, partial_text: str) -> str:
@@ -1369,7 +1532,7 @@ def _warmup_live_pipeline(pipeline: StreamingCascadePipeline) -> None:
             waveform=samples,
             sample_rate=pipeline.config.runtime.sample_rate,
         )
-        pipeline.embedder.extract(chunk)
+        pipeline.local_diarizer.analyze(chunk)
     except Exception as exc:
         print(f"[warn] speaker warmup failed: {type(exc).__name__}: {exc}")
 
@@ -1424,6 +1587,9 @@ def _event_to_dict(event: PipelineEvent) -> dict[str, Any]:
         "text": event.text,
         "confidence": event.confidence,
         "message": event.message,
+        "words": event.words or [],
+        "speaker_segments": event.speaker_segments or [],
+        "timestamp_status": event.timestamp_status,
     }
 
 
@@ -1434,6 +1600,7 @@ def _turn_to_dict(turn: TranscriptTurn) -> dict[str, Any]:
         "speaker_id": turn.speaker_id,
         "text": turn.text,
         "confidence": turn.confidence,
+        "words": [_word_to_dict(word) for word in (turn.words or [])],
     }
 
 
